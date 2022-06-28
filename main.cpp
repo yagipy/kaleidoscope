@@ -1,13 +1,28 @@
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
-// レキサー
+using namespace llvm;
+
+//===----------------------------------------------------------------------===//
+// Lexer
+//===----------------------------------------------------------------------===//
 
 enum Token {
     token_eof = -1,
@@ -74,13 +89,20 @@ static int getToken() {
     return ThisChar;
 }
 
-// ast
+//===----------------------------------------------------------------------===//
+// Abstract Syntax Tree (aka Parse Tree)
+//===----------------------------------------------------------------------===//
+
 // 式、プロトタイプ、関数オブジェクトが存在する
 namespace {
     // 式
     class ExprAST {
     public:
         virtual ~ExprAST() = default;
+        // 該当のASTノードのIRを、依存するすべてのものと一緒に返却する
+        // Valueは、LLVMで"Static Single Assignment (SSA) register"または"SSA value"を表すために使われるクラス
+        // SSAはその値が関連する命令の実行時に計算され、イミュータブルである(参考: https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html)
+        virtual Value *codegen() = 0;
     };
 
     // 数値リテラル
@@ -88,6 +110,7 @@ namespace {
         double Val; // 数値
     public:
         NumberExprAST(double Val): Val(Val) {}
+        Value *codegen() override;
     };
 
     // 変数
@@ -95,6 +118,7 @@ namespace {
         std::string Name; // 変数名
     public:
         VariableExprAST(const std::string &Name): Name(Name) {}
+        Value *codegen() override;
     };
 
     // 二項演算子(binary operator)
@@ -103,6 +127,7 @@ namespace {
         std::unique_ptr<ExprAST> LHS, RHS;
     public:
         BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS, std::unique_ptr<ExprAST> RHS): Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+        Value *codegen() override;
     };
 
     // 関数呼び出し
@@ -111,6 +136,7 @@ namespace {
         std::vector<std::unique_ptr<ExprAST>> Args; // 引数式
     public:
         CallExprAST(const std::string &Callee, std::vector<std::unique_ptr<ExprAST>> Args): Callee(Callee), Args(std::move(Args)) {}
+        Value *codegen() override;
     };
 
     // 関数のプロトタイプ(インターフェース)
@@ -119,6 +145,7 @@ namespace {
         std::vector<std::string> Args; // 引数名
     public:
         PrototypeAST(const std::string &Name, std::vector<std::string> Args): Name(Name), Args(std::move(Args)) {}
+        Function *codegen();
         const std::string &getName() const { return Name; }
     };
 
@@ -128,10 +155,13 @@ namespace {
         std::unique_ptr<ExprAST> Body;
     public:
         FunctionAST(std::unique_ptr<PrototypeAST> Proto, std::unique_ptr<ExprAST> Body): Proto(std::move(Proto)), Body(std::move(Body)) {}
+        Function *codegen();
     };
 }
 
-// parser
+//===----------------------------------------------------------------------===//
+// Parser
+//===----------------------------------------------------------------------===//
 
 // パーサーが現在見ているトークン
 static int CurrentToken;
@@ -329,27 +359,176 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
     return ParsePrototype();
 }
 
-// top level parsing
+//===----------------------------------------------------------------------===//
+// Code Generation
+//===----------------------------------------------------------------------===//
+
+// 型と定数値のテーブルのような、多くのLLVMのコアデータ構造を所有するオブジェクト
+static std::unique_ptr<LLVMContext> TheContext;
+// LLVMの命令を簡単に生成できるようにするヘルパーオブジェクト。IRBuilderクラスのテンプレートのインスタンスは、命令を挿入する現在の場所を追跡し、新しい命令を作成するためのメソッドを持っている
+static std::unique_ptr<IRBuilder<>> Builder;
+// 関数とグローバル変数を含むLLVMの構成要素。LLVM IRがコードを含むために使用する可能性の高いトップレベルの構造。codegen()メソッドがunique_ptr<Value>ではなく、生のValue*を返す理由であり、生成するすべてのIRのためのメモリを所有する
+static std::unique_ptr<Module> TheModule;
+// 現在のスコープでどの値が定義され、そのLLVM表現が何であるかを追跡する(コードのシンボルテーブル)。現状は関数パラメータのみ参照できる。
+static std::map<std::string, Value *> NamedValues;
+
+Value *LogErrorV(const char *Str) {
+    LogError(Str);
+    return nullptr;
+}
+
+Value *NumberExprAST::codegen() {
+    // 数値定数はConstantFPクラス
+    // 内部でAPFloatに数値を保持します(APFloatはArbitrary Precisionの浮動小数点定数を保持できる機能を持っている)
+    return ConstantFP::get(*TheContext, APFloat(Val));
+}
+
+Value *VariableExprAST::codegen() {
+    Value *V = NamedValues[Name];
+    if (!V)
+        LogErrorV("Unknown variable name");
+    return V;
+}
+
+Value *BinaryExprAST::codegen() {
+    // それぞれ再帰的に出力
+    Value *L = LHS->codegen();
+    Value *R = RHS->codegen();
+    if (!L || !R)
+        return nullptr;
+
+    switch (Op) {
+        case '+':
+            return Builder->CreateFAdd(L, R, "addtmp");
+        case '-':
+            return Builder->CreateFSub(L, R, "subtmp");
+        case '*':
+            return Builder->CreateFMul(L, R, "multmp");
+        case '<':
+            L = Builder->CreateFCmpULT(L, R, "cmptmp");
+            // fcmp命令は常に「i1」値(1ビットの整数)を返すと規定されているが、0.0または1.0の値が欲しいので変換を行っている
+            return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
+        default:
+            return LogErrorV("invalid binary operator");
+    }
+}
+
+Value *CallExprAST::codegen() {
+    // シンボルテーブルから取得
+    Function *CalleeF = TheModule->getFunction(Callee);
+    if (!CalleeF)
+        return LogErrorV("Unknown function referenced");
+
+    if (CalleeF->arg_size() != Args.size())
+        return LogErrorV("Incorrect # arguments passed");
+
+    std::vector<Value *> ArgsV;
+    for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+        // 各引数を再帰的にコード化
+        ArgsV.push_back(Args[i]->codegen());
+        if (!ArgsV.back())
+            return nullptr;
+    }
+
+    return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
+}
+
+Function *PrototypeAST::codegen() {
+    // LLVM double型のN個のベクトルを作成する
+    std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
+    // 与えられたプロトタイプに対して使用されるべきFunctionTypeを作成する。false=可変長引数ではない。型は定数なのでgetになる
+    FunctionType *FT = FunctionType::get(Type::getDoubleTy(*TheContext), Doubles, false);
+    // プロトタイプに対応するIR Functionを作成する。使用する型、リンク、名前と、どのモジュールに挿入するかを示す
+    // ExternalLinkage=関数が現在のモジュールの外部で定義され、かつ、モジュールの外部の関数から呼び出される可能性があることを意味する
+    // TheModuleのシンボルテーブルに登録される
+    Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+
+    // 各引数の名前を、Prototypeで与えられた名前に従って設定する
+    unsigned Idx = 0;
+    for (auto &Arg: F->args())
+        Arg.setName(Args[Idx++]);
+
+    return F;
+}
+
+Function *FunctionAST::codegen() {
+    Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+    if (!TheFunction) // 以前のバージョンが存在しない場合
+        TheFunction = Proto->codegen();
+
+    if (!TheFunction)
+        return nullptr;
+
+    if (!TheFunction->empty())
+        return (Function *)LogErrorV("Function cannot be redefined");
+
+    BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
+    Builder->SetInsertPoint(BB);
+
+    // NamedValuesに引数を保存(VariableExprASTノードからアクセスできるようにする)
+    NamedValues.clear();
+    for (auto &Arg: TheFunction->args())
+        NamedValues[std::string(Arg.getName())] = &Arg;
+
+    if (Value *RetVal = Body->codegen()) {
+        Builder->CreateRet(RetVal);
+
+        // 生成されたコードに対して様々な整合性チェックを行い、コンパイラが正しく動作しているかどうかを判断する
+        verifyFunction(*TheFunction);
+
+        return TheFunction;
+    }
+
+    // エラー処理
+    TheFunction->eraseFromParent();
+    return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModule() {
+    TheContext = std::make_unique<LLVMContext>();
+    TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+
+    Builder = std::make_unique<IRBuilder<>>(*TheContext);
+}
 
 static void HandleDefinition() {
-    if (ParseDefinition()) {
-        fprintf(stderr, "Parsed a function definition\n");
+    if (auto FnAST = ParseDefinition()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Read function definition:\n");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     } else {
         getNextToken();
     }
 }
 
 static void HandleExtern() {
-    if (ParseExtern()) {
-        fprintf(stderr, "Parsed an extern\n");
+    if (auto ProtoAST = ParseExtern()) {
+        if (auto *FnIR = ProtoAST->codegen()) {
+            fprintf(stderr, "Read extern:\n");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+        }
     } else {
         getNextToken();
     }
 }
 
 static void HandleTopLevelExpression() {
-    if (ParseTopLevelExpr()) {
-        fprintf(stderr, "Parsed a top-level expr\n");
+    if (auto FnAST = ParseTopLevelExpr()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Read top-level expression:\n");
+            FnIR->print(errs());
+            fprintf(stderr, "\n");
+
+            FnIR->eraseFromParent();
+        }
     } else {
         getNextToken();
     }
@@ -388,7 +567,11 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
+    InitializeModule();
+
     MainLoop();
+
+    TheModule->print(errs(), nullptr);
 
     return 0;
 }

@@ -3,7 +3,7 @@
 
 ```shell
 # Compile
-clang++ -g -O3 main.cpp `llvm-config --cxxflags`
+clang++ -g -O3 main.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core`
 
 # Run
 ./a.out
