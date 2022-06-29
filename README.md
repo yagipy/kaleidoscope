@@ -3,7 +3,7 @@
 
 ```shell
 # Compile
-clang++ -g -O3 main.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core`
+clang++ -g -O3 main.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native`
 
 # Run
 ./a.out

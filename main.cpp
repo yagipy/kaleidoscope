@@ -1,3 +1,4 @@
+#include "include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -6,9 +7,15 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -19,6 +26,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -371,9 +379,29 @@ static std::unique_ptr<IRBuilder<>> Builder;
 static std::unique_ptr<Module> TheModule;
 // 現在のスコープでどの値が定義され、そのLLVM表現が何であるかを追跡する(コードのシンボルテーブル)。現状は関数パラメータのみ参照できる。
 static std::map<std::string, Value *> NamedValues;
+static std::unique_ptr<legacy::FunctionPassManager> TheFunctionPassManager;
+// sinやcosを呼べる
+// JITに追加されたすべてのモジュールを、新しいものから順に検索し、最新の定義を見つける
+// 見つからない場合は、Kaleidoscopeプロセス自体で "dlsym("sin")" を呼び出す
+// libm版のsinを直接呼び出される
+static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+static ExitOnError ExitOnErr;
 
 Value *LogErrorV(const char *Str) {
     LogError(Str);
+    return nullptr;
+}
+
+// TheModuleを検索して既存の関数宣言を見つけ、見つからなければFunctionProtosから新しい宣言を生成するようにフォールバック
+Function *getFunction(std::string Name) {
+    if (auto *F = TheModule->getFunction(Name))
+        return F;
+
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end())
+        return FI->second->codegen();
+
     return nullptr;
 }
 
@@ -414,8 +442,8 @@ Value *BinaryExprAST::codegen() {
 }
 
 Value *CallExprAST::codegen() {
-    // シンボルテーブルから取得
-    Function *CalleeF = TheModule->getFunction(Callee);
+    // グローバルのModuleから取得
+    Function *CalleeF = getFunction(Callee);
     if (!CalleeF)
         return LogErrorV("Unknown function referenced");
 
@@ -452,7 +480,9 @@ Function *PrototypeAST::codegen() {
 }
 
 Function *FunctionAST::codegen() {
-    Function *TheFunction = TheModule->getFunction(Proto->getName());
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    Function *TheFunction = getFunction(P.getName());
 
     if (!TheFunction) // 以前のバージョンが存在しない場合
         TheFunction = Proto->codegen();
@@ -477,6 +507,9 @@ Function *FunctionAST::codegen() {
         // 生成されたコードに対して様々な整合性チェックを行い、コンパイラが正しく動作しているかどうかを判断する
         verifyFunction(*TheFunction);
 
+        // 関数の最適化
+        TheFunctionPassManager->run(*TheFunction);
+
         return TheFunction;
     }
 
@@ -489,9 +522,17 @@ Function *FunctionAST::codegen() {
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-static void InitializeModule() {
+static void InitializeModuleAndPassManager() {
     TheContext = std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
+    TheModule->setDataLayout(TheJIT->getDataLayout());
+
+    TheFunctionPassManager = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+    TheFunctionPassManager->add(createInstructionCombiningPass());
+    TheFunctionPassManager->add(createReassociatePass());
+    TheFunctionPassManager->add(createGVNPass());
+    TheFunctionPassManager->add(createCFGSimplificationPass());
+    TheFunctionPassManager->doInitialization();
 
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
@@ -502,6 +543,8 @@ static void HandleDefinition() {
             fprintf(stderr, "Read function definition:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+            InitializeModuleAndPassManager();
         }
     } else {
         getNextToken();
@@ -514,6 +557,7 @@ static void HandleExtern() {
             fprintf(stderr, "Read extern:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
+            FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
         }
     } else {
         getNextToken();
@@ -523,11 +567,26 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
     if (auto FnAST = ParseTopLevelExpr()) {
         if (auto *FnIR = FnAST->codegen()) {
-            fprintf(stderr, "Read top-level expression:\n");
+            fprintf(stderr, "Read top level expression:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
 
-            FnIR->eraseFromParent();
+            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+            // 後続のコードを格納する新しいモジュールを追加する
+            InitializeModuleAndPassManager();
+
+            // 最終的に生成されるコードへのポインタを取得
+            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+            // 関数のメモリ内アドレスを取得
+            double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+            // 結果ポインタをその型の関数ポインタにキャストして直接呼び出すだけで良い(JITコンパイルされたコードと、アプリケーションに静的にリンクされたネイティブのマシンコードとの間に差はない)
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            ExitOnErr(RT->remove());
         }
     } else {
         getNextToken();
@@ -556,9 +615,35 @@ static void MainLoop() {
     }
 }
 
-// main driver code
+//===----------------------------------------------------------------------===//
+// "Library" functions that can be "extern'd" from user code.
+//===----------------------------------------------------------------------===//
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+extern "C" DLLEXPORT double putchard(double X) {
+    fputc((char)X, stderr);
+    return 0;
+}
+
+extern "C" DLLEXPORT double printd(double X) {
+    fprintf(stderr, "%f\n", X);
+    return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
 
 int main() {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     BinaryOperatorPrecedence['<'] = 10;
     BinaryOperatorPrecedence['+'] = 20;
     BinaryOperatorPrecedence['-'] = 20;
@@ -567,7 +652,9 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    InitializeModule();
+    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+
+    InitializeModuleAndPassManager();
 
     MainLoop();
 
