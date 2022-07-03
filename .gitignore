@@ -1,4 +1,4 @@
 .idea
 doc
-a.out
-a.out.dSYM
+out
+cmake-build-debug

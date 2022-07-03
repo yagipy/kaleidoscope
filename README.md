@@ -3,8 +3,12 @@
 
 ```shell
 # Compile
-clang++ -g -O3 main.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native`
+clang++ -g -O3 main.cpp -o out/main `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native`
 
 # Run
-./a.out
+./out/main
+
+# Output CFG
+cd ir
+opt <FILE_NAME> -dot-cfg > /dev/null
 ```

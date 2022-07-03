@@ -41,7 +41,14 @@ enum Token {
 
     // primary
     token_identifier = -4,
-    token_number = -5
+    token_number = -5,
+
+    // control
+    token_if = -6,
+    token_then = -7,
+    token_else = -8,
+    token_for = -9,
+    token_in = -10
 };
 
 static std::string IdentifierStr; // Filled in if token_identifier
@@ -63,6 +70,16 @@ static int getToken() {
             return token_def;
         if (IdentifierStr == "extern")
             return token_extern;
+        if (IdentifierStr == "if")
+            return token_if;
+        if (IdentifierStr == "then")
+            return token_then;
+        if (IdentifierStr == "else")
+            return token_else;
+        if (IdentifierStr == "for")
+            return token_for;
+        if (IdentifierStr == "in")
+            return token_in;
         return token_identifier;
     }
 
@@ -144,6 +161,24 @@ namespace {
         std::vector<std::unique_ptr<ExprAST>> Args; // 引数式
     public:
         CallExprAST(const std::string &Callee, std::vector<std::unique_ptr<ExprAST>> Args): Callee(Callee), Args(std::move(Args)) {}
+        Value *codegen() override;
+    };
+
+    // if
+    class IfExprAST: public ExprAST {
+        std::unique_ptr<ExprAST> Condition, Then, Else;
+    public:
+        IfExprAST(std::unique_ptr<ExprAST> Condition, std::unique_ptr<ExprAST> Then, std::unique_ptr<ExprAST> Else): Condition(std::move(Condition)), Then(std::move(Then)), Else(std::move(Else)) {}
+        Value *codegen() override;
+    };
+
+    // for
+    class ForExprAST: public ExprAST {
+        std::string VarName;
+        std::unique_ptr<ExprAST> Start, End, Step, Body;
+    public:
+        ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start, std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step, std::unique_ptr<ExprAST> Body)
+        : VarName(VarName), Start(std::move(Start)), End(std::move(End)), Step(std::move(Step)), Body(std::move(Body)) {}
         Value *codegen() override;
     };
 
@@ -260,6 +295,78 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
     return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+    getNextToken();
+
+    auto Condition = ParseExpression();
+    if (!Condition)
+        return nullptr;
+
+    if (CurrentToken != token_then)
+        return LogError("expected then");
+    getNextToken();
+
+    auto Then = ParseExpression();
+    if (!Then)
+        return nullptr;
+
+    if (CurrentToken != token_else)
+        return LogError("expected else");
+    getNextToken();
+
+    auto Else = ParseExpression();
+    if (!Else)
+        return nullptr;
+
+    return std::make_unique<IfExprAST>(std::move(Condition), std::move(Then), std::move(Else));
+}
+
+// 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static std::unique_ptr<ExprAST> ParseForExpr() {
+    getNextToken();
+
+    if (CurrentToken != token_identifier)
+        return LogError("expected identifier after for");
+
+    std::string IdName = IdentifierStr;
+    getNextToken();
+
+    if (CurrentToken != '=')
+        return LogError("expected '=' after for");
+    getNextToken();
+
+    auto Start = ParseExpression();
+    if (!Start)
+        return nullptr;
+    if (CurrentToken != ',')
+        return LogError("expected ',' after for start value");
+    getNextToken();
+
+    auto End = ParseExpression();
+    if (!End)
+        return nullptr;
+
+    // Stepはオプション
+    // 2番目のカンマが存在するかどうかで判断
+    std::unique_ptr<ExprAST> Step;
+    if (CurrentToken == ',') {
+        getNextToken();
+        Step = ParseExpression();
+        if (!Step)
+            return nullptr;
+    }
+
+    if (CurrentToken != token_in)
+        return LogError("expected 'in' after for");
+    getNextToken();
+
+    auto Body = ParseExpression();
+    if (!Body)
+        return nullptr;
+
+    return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
+}
+
 // 任意の一次式をパース
 static std::unique_ptr<ExprAST> ParsePrimary() {
     switch (CurrentToken) {
@@ -271,6 +378,10 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseNumberExpr();
         case '(':
             return ParseParenExpr();
+        case token_if:
+            return ParseIfExpr();
+        case token_for:
+            return ParseForExpr();
     }
 }
 
@@ -461,6 +572,125 @@ Value *CallExprAST::codegen() {
     return Builder->CreateCall(CalleeF, ArgsV, "calltmp");
 }
 
+Value *IfExprAST::codegen() {
+    Value *ConditionV = Condition->codegen();
+    if (!ConditionV)
+        return nullptr;
+
+    // 0.0と条件式を比較し真偽値に変換する
+    ConditionV = Builder->CreateFCmpONE(ConditionV, ConstantFP::get(*TheContext, APFloat(0.0)), "ifcond");
+
+    // 現在構築されているFunctionオブジェクトを取得
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // TheFunctionを渡すことで、自動的に新しいブロックを指定された関数の末尾に挿入する
+    BasicBlock *ThenBB = BasicBlock::Create(*TheContext, "then", TheFunction);
+    // 下記2つのブロックは作成されますが、まだ関数に挿入されない
+    BasicBlock *ElseBB = BasicBlock::Create(*TheContext, "else");
+    BasicBlock *MergeBB = BasicBlock::Create(*TheContext, "ifcont");
+
+    // 条件分岐を挿入
+    Builder->CreateCondBr(ConditionV, ThenBB, ElseBB);
+
+    // 「then」ブロックに挿入を開始する(指定されたブロックの末尾に挿入ポイントが移動する)
+    Builder->SetInsertPoint(ThenBB);
+
+    Value *ThenV = Then->codegen();
+    if (!ThenV)
+        return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    // Then->codegenによってブロックが変更されてしまう可能性がある(if/then/elseのネスト等)
+    // 最新を取得する必要がある
+    ThenBB = Builder->GetInsertBlock();
+
+    TheFunction->getBasicBlockList().push_back(ElseBB);
+    Builder->SetInsertPoint(ElseBB);
+
+    Value *ElseV = Else->codegen();
+    if (!ElseV)
+        return nullptr;
+
+    Builder->CreateBr(MergeBB);
+    ElseBB = Builder->GetInsertBlock();
+
+    TheFunction->getBasicBlockList().push_back(MergeBB);
+    Builder->SetInsertPoint(MergeBB);
+    PHINode *PN = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, "iftmp");
+
+    // PHIのブロックと値のペアをセットアップ
+    PN->addIncoming(ThenV, ThenBB);
+    PN->addIncoming(ElseV, ElseBB);
+    return PN;
+}
+
+Value *ForExprAST::codegen() {
+    Value *StartVal = Start->codegen();
+    if (!StartVal)
+        return nullptr;
+
+    // ループヘッダ用の新しいブロックを作成し、挿入する
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+    BasicBlock *PreHeaderBB = Builder->GetInsertBlock();
+    BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
+
+    // 現在のブロックからLoopBBへの明示的なフォールスルーを挿入する
+    Builder->CreateBr(LoopBB);
+
+    Builder->SetInsertPoint(LoopBB);
+
+    // ループ誘導変数用のPHIノードを作成する
+    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
+    Variable->addIncoming(StartVal, PreHeaderBB);
+
+    // シンボルテーブルに変数を導入(シャドーイング)
+    Value *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Variable;
+
+    // Bodyのコード化
+    if (!Body->codegen())
+        return nullptr;
+
+    // Stepのコード化
+    Value *StepVal = nullptr;
+    if (Step) {
+        StepVal = Step->codegen();
+        if (!StepVal)
+            return nullptr;
+    } else {
+        StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+    }
+
+    // ループの次の繰り返しにおけるループ変数の値
+    Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
+
+    Value *EndCondition = End->codegen();
+    if (!EndCondition)
+        return nullptr;
+
+    // ループの終了値を評価
+    // if/then/else文の条件評価と同じ
+    EndCondition = Builder->CreateFCmpONE(EndCondition, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+    BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+    BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+    // 終了条件の値に基づいて、ループの再実行とループの終了のどちらかを選択する条件分岐を作成する
+    Builder->CreateCondBr(EndCondition, LoopBB, AfterBB);
+    Builder->SetInsertPoint(AfterBB);
+
+    Variable->addIncoming(NextVar, LoopEndBB);
+
+    // ループ変数をシンボルテーブルから削除
+    if (OldVal)
+        NamedValues[VarName] = OldVal;
+    else
+        NamedValues.erase(VarName);
+
+    // forループのコード生成は常に0.0を返す
+    return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
 Function *PrototypeAST::codegen() {
     // LLVM double型のN個のベクトルを作成する
     std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(*TheContext));
@@ -639,7 +869,7 @@ extern "C" DLLEXPORT double printd(double X) {
 // Main driver code.
 //===----------------------------------------------------------------------===//
 
-int main() {
+int main(int argc, char *argv[]) {
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
     InitializeNativeTargetAsmParser();
