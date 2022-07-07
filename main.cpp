@@ -48,7 +48,11 @@ enum Token {
     token_then = -7,
     token_else = -8,
     token_for = -9,
-    token_in = -10
+    token_in = -10,
+
+    // operators
+    token_binary = -11,
+    token_unary = -12
 };
 
 static std::string IdentifierStr; // Filled in if token_identifier
@@ -80,6 +84,10 @@ static int getToken() {
             return token_for;
         if (IdentifierStr == "in")
             return token_in;
+        if (IdentifierStr == "binary")
+            return token_binary;
+        if (IdentifierStr == "unary")
+            return token_unary;
         return token_identifier;
     }
 
@@ -155,6 +163,15 @@ namespace {
         Value *codegen() override;
     };
 
+    // 単項演算子(unary operator)
+    class UnaryExprAST: public ExprAST {
+        char Opcode;
+        std::unique_ptr<ExprAST> Operand;
+    public:
+        UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand): Opcode(Opcode), Operand(std::move(Operand)) {}
+        Value *codegen() override;
+    };
+
     // 関数呼び出し
     class CallExprAST: public ExprAST {
         std::string Callee; // 関数名
@@ -186,10 +203,22 @@ namespace {
     class PrototypeAST {
         std::string Name; // 関数名
         std::vector<std::string> Args; // 引数名
+        bool IsOperator;
+        unsigned Precedence; // Precedence if a binary operator
     public:
-        PrototypeAST(const std::string &Name, std::vector<std::string> Args): Name(Name), Args(std::move(Args)) {}
+        PrototypeAST(const std::string &Name, std::vector<std::string> Args, bool IsOperator = false, unsigned Precedence = 0): Name(Name), Args(std::move(Args)), IsOperator(IsOperator), Precedence(Precedence) {}
         Function *codegen();
         const std::string &getName() const { return Name; }
+
+        bool isUnaryOperator() const { return IsOperator && Args.size() == 1; }
+        bool isBinaryOperator() const { return IsOperator && Args.size() == 2; }
+
+        char getOperatorName() const {
+            assert(isUnaryOperator() || isBinaryOperator());
+            return Name[Name.size() - 1];
+        }
+
+        unsigned getBinaryPrecedence() const { return Precedence; }
     };
 
     // 関数
@@ -385,6 +414,20 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     }
 }
 
+static std::unique_ptr<ExprAST> ParseUnary() {
+    // CurrentTokenが演算子でない場合は、PrimaryExprでなければならない
+    if (!isascii(CurrentToken) || CurrentToken == '(' || CurrentToken == ',')
+        return ParsePrimary();
+
+    // 単項演算子の場合
+    // 演算子をOpcodeとする
+    int Opc = CurrentToken;
+    getNextToken();
+    if (auto Operand = ParseUnary()) // 残りの部分を単項演算子としてパースする
+        return std::make_unique<UnaryExprAST>(Opc, std::move(Operand));
+    return nullptr;
+}
+
 // ペアのシーケンスをパースする
 // 優先順位とこれまでにパースされた部分の式へのポインタを受け取る
 // 渡される優先順位の値は、この関数が処理することができる最小の演算子の優先順位
@@ -399,7 +442,7 @@ static std::unique_ptr<ExprAST> ParseBinaryOperatorRHS(int ExprPrecedence, std::
         int BinaryOperator = CurrentToken;
         getNextToken(); // 二項演算子を読み進める
 
-        auto RHS = ParsePrimary();
+        auto RHS = ParseUnary();
         if (!RHS)
             return nullptr;
 
@@ -422,7 +465,7 @@ static std::unique_ptr<ExprAST> ParseBinaryOperatorRHS(int ExprPrecedence, std::
 // "a+b+(c+d)*e*f+g" => 「a」を解析し、次に[+, b] [+, (c+d)] [*, e] [*, f] [+, g] のペアを順番に見ていく
 // 括弧は一次式なので、二項演算子のパーサーは考慮する必要がない
 static std::unique_ptr<ExprAST> ParseExpression() {
-    auto LHS = ParsePrimary(); // 上記例の'a'をパース(CurrentTokenは'+'になる)
+    auto LHS = ParseUnary(); // 上記例の'a'をパース(CurrentTokenは'+'になる)
     if (!LHS)
         return nullptr;
 
@@ -431,11 +474,47 @@ static std::unique_ptr<ExprAST> ParseExpression() {
 
 // 関数のプロトタイプをパース
 static std::unique_ptr<PrototypeAST> ParsePrototype() {
-    if (CurrentToken != token_identifier)
-        return LogErrorP("Expected function name in prototype");
+    std::string FnName;
 
-    std::string FunctionName = IdentifierStr;
-    getNextToken();
+    unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary
+    unsigned BinaryPrecedence = 30;
+
+    switch (CurrentToken) {
+        default:
+            return LogErrorP("Expected function name in prototype");
+        case token_identifier:
+            FnName = IdentifierStr;
+            Kind = 0;
+            getNextToken();
+            break;
+        case token_unary:
+            getNextToken();
+            if (!isascii(CurrentToken))
+                return LogErrorP("Expected unary operator");
+            FnName = "unary";
+            FnName += (char)CurrentToken;
+            Kind = 1;
+            getNextToken();
+            break;
+        case token_binary:
+            getNextToken();
+            if (!isascii(CurrentToken))
+                return LogErrorP("Expected binary operator");
+            // 二項演算子だった場合、関数名は"binary~~になる"(例: "@"演算子の場合、"binary@"のような名前を構築する)
+            // LLVMのシンボルテーブルのシンボル名には、nullの埋め込みも含めて、どんな文字でも許される
+            FnName = "binary";
+            FnName += (char)CurrentToken;
+            Kind = 2;
+            getNextToken();
+
+            if (CurrentToken == token_number) {
+                if (NumVal < 1 || NumVal > 100)
+                    return LogErrorP("Invalid precedence: must be 1..100");
+                BinaryPrecedence = (unsigned)NumVal;
+                getNextToken();
+            }
+            break;
+    }
 
     if (CurrentToken != '(')
         return LogErrorP("Expected '(' in prototype");
@@ -449,7 +528,10 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
 
     getNextToken();
 
-    return std::make_unique<PrototypeAST>(FunctionName, std::move(ArgNames));
+    if (Kind && ArgNames.size() != Kind)
+        return LogErrorP("Invalid number of operands for operator");
+
+    return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames), Kind != 0, BinaryPrecedence);
 }
 
 // 関数定義をパース
@@ -529,6 +611,18 @@ Value *VariableExprAST::codegen() {
     return V;
 }
 
+Value *UnaryExprAST::codegen() {
+    Value *OperandV = Operand->codegen();
+    if (!OperandV)
+        return nullptr;
+
+    Function *F = getFunction(std::string("unary") + Opcode);
+    if (!F)
+        return LogErrorV("Unknown unary operator");
+
+    return Builder->CreateCall(F, OperandV, "unop");
+}
+
 Value *BinaryExprAST::codegen() {
     // それぞれ再帰的に出力
     Value *L = LHS->codegen();
@@ -548,8 +642,16 @@ Value *BinaryExprAST::codegen() {
             // fcmp命令は常に「i1」値(1ビットの整数)を返すと規定されているが、0.0または1.0の値が欲しいので変換を行っている
             return Builder->CreateUIToFP(L, Type::getDoubleTy(*TheContext), "booltmp");
         default:
-            return LogErrorV("invalid binary operator");
+            break;
     }
+
+    // 組み込みの二項演算子でない場合、ユーザー定義の二項演算子である必要がある。それを呼び出す
+    // シンボルテーブルから適切な演算子を探し、その演算子への関数呼び出しを生成する(ユーザー定義演算子は通常の関数として構築される)
+    Function *F = getFunction(std::string("binary") + Op);
+    assert(F && "binary operator not found!");
+
+    Value *Ops[2] = { L, R };
+    return Builder->CreateCall(F, Ops, "binop");
 }
 
 Value *CallExprAST::codegen() {
@@ -714,14 +816,18 @@ Function *FunctionAST::codegen() {
     FunctionProtos[Proto->getName()] = std::move(Proto);
     Function *TheFunction = getFunction(P.getName());
 
-    if (!TheFunction) // 以前のバージョンが存在しない場合
-        TheFunction = Proto->codegen();
+//    if (!TheFunction) // 以前のバージョンが存在しない場合
+//        TheFunction = Proto->codegen();
 
     if (!TheFunction)
         return nullptr;
 
-    if (!TheFunction->empty())
-        return (Function *)LogErrorV("Function cannot be redefined");
+//    if (!TheFunction->empty())
+//        return (Function *)LogErrorV("Function cannot be redefined");
+
+    // ユーザー定義演算子の場合、優先順位表に登録する
+    if (P.isBinaryOperator())
+        BinaryOperatorPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
     BasicBlock *BB = BasicBlock::Create(*TheContext, "entry", TheFunction);
     Builder->SetInsertPoint(BB);
