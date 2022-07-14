@@ -6,6 +6,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -16,6 +17,7 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Utils.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -52,20 +54,25 @@ enum Token {
 
     // operators
     token_binary = -11,
-    token_unary = -12
+    token_unary = -12,
+
+    // var
+    token_var = -13
 };
 
 static std::string IdentifierStr; // Filled in if token_identifier
 static double NumVal; // Filled in if token_number
 
+// Tokenのenum値かASCIIを返却する
 static int getToken() {
     static int LastChar = ' ';
 
-    // skip any whitespace
+    // ホワイトスペースをスキップ
     while (isspace(LastChar))
         LastChar = getchar();
 
     if (isalpha(LastChar)) { // identifier: [a-zA-Z][a-zA-Z0-9]*
+        // 読み込めるだけ読み込んで識別子や特定のキーワード(def, etc...)があるか確認しあったら返却
         IdentifierStr = LastChar;
         while (isalnum((LastChar = getchar())))
             IdentifierStr += LastChar;
@@ -88,6 +95,8 @@ static int getToken() {
             return token_binary;
         if (IdentifierStr == "unary")
             return token_unary;
+        if (IdentifierStr == "var")
+            return token_var;
         return token_identifier;
     }
 
@@ -103,7 +112,7 @@ static int getToken() {
     }
 
     if (LastChar == '#') {
-        // Comment until end of line.
+        // 行の最後までコメントアウト
         do {
             LastChar = getchar();
         } while (LastChar != EOF && LastChar != '\n' && LastChar != '\r');
@@ -112,7 +121,7 @@ static int getToken() {
             return getToken();
     }
 
-    // Chack for end of file, Don't eat the EOF.
+    // EOFチェック
     if (LastChar == EOF)
         return token_eof;
 
@@ -152,6 +161,7 @@ namespace {
     public:
         VariableExprAST(const std::string &Name): Name(Name) {}
         Value *codegen() override;
+        const std::string &getName() const { return Name; }
     };
 
     // 二項演算子(binary operator)
@@ -196,6 +206,15 @@ namespace {
     public:
         ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start, std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step, std::unique_ptr<ExprAST> Body)
         : VarName(VarName), Start(std::move(Start)), End(std::move(End)), Step(std::move(Step)), Body(std::move(Body)) {}
+        Value *codegen() override;
+    };
+
+    // var
+    class VarExprAST: public ExprAST {
+        std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+        std::unique_ptr<ExprAST> Body;
+    public:
+        VarExprAST(std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames, std::unique_ptr<ExprAST> Body): VarNames(std::move(VarNames)), Body(std::move(Body)) {}
         Value *codegen() override;
     };
 
@@ -396,6 +415,48 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
     return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
 }
 
+static std::unique_ptr<ExprAST> ParseVarExpr() {
+    getNextToken();
+
+    std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+    if (CurrentToken != token_identifier)
+        return LogError("expected identifier after var");
+
+    while (true) {
+        std::string Name = IdentifierStr;
+        getNextToken();
+
+        std::unique_ptr<ExprAST> Init = nullptr;
+        if (CurrentToken == '=') {
+            getNextToken();
+
+            Init = ParseExpression();
+            if (!Init)
+                return nullptr;
+        }
+
+        VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+        if (CurrentToken != ',')
+            break;
+        getNextToken();
+
+        if (CurrentToken != token_identifier)
+            return LogError("expected identifier list after var");
+    }
+
+    if (CurrentToken != token_in)
+        return LogError("expected 'in' keyword after 'var'");
+    getNextToken();
+
+    auto Body = ParseExpression();
+    if (!Body)
+        return nullptr;
+
+    return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
+
 // 任意の一次式をパース
 static std::unique_ptr<ExprAST> ParsePrimary() {
     switch (CurrentToken) {
@@ -411,6 +472,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseIfExpr();
         case token_for:
             return ParseForExpr();
+        case token_var:
+            return ParseVarExpr();
     }
 }
 
@@ -571,7 +634,7 @@ static std::unique_ptr<IRBuilder<>> Builder;
 // 関数とグローバル変数を含むLLVMの構成要素。LLVM IRがコードを含むために使用する可能性の高いトップレベルの構造。codegen()メソッドがunique_ptr<Value>ではなく、生のValue*を返す理由であり、生成するすべてのIRのためのメモリを所有する
 static std::unique_ptr<Module> TheModule;
 // 現在のスコープでどの値が定義され、そのLLVM表現が何であるかを追跡する(コードのシンボルテーブル)。現状は関数パラメータのみ参照できる。
-static std::map<std::string, Value *> NamedValues;
+static std::map<std::string, AllocaInst *> NamedValues;
 static std::unique_ptr<legacy::FunctionPassManager> TheFunctionPassManager;
 // sinやcosを呼べる
 // JITに追加されたすべてのモジュールを、新しいものから順に検索し、最新の定義を見つける
@@ -598,17 +661,27 @@ Function *getFunction(std::string Name) {
     return nullptr;
 }
 
+// 関数のエントリブロックにalloca命令を作成する
+// ミュータブル変数などに使用される
+static AllocaInst *CreateEntryBlockAlloca(Function *TheFunction, StringRef VarName) {
+    // エントリブロックの最初の命令(.begin())を指しているIRBuilderオブジェクトを作成
+    IRBuilder<> TmpB(&TheFunction->getEntryBlock(), TheFunction->getEntryBlock().begin());
+    // 期待される名前のallocaを作成し返却
+    return TmpB.CreateAlloca(Type::getDoubleTy(*TheContext), nullptr, VarName);
+}
+
 Value *NumberExprAST::codegen() {
     // 数値定数はConstantFPクラス
     // 内部でAPFloatに数値を保持します(APFloatはArbitrary Precisionの浮動小数点定数を保持できる機能を持っている)
     return ConstantFP::get(*TheContext, APFloat(Val));
 }
 
+// 変数はスタック上に存在する
 Value *VariableExprAST::codegen() {
-    Value *V = NamedValues[Name];
-    if (!V)
+    AllocaInst *A = NamedValues[Name];
+    if (!A)
         LogErrorV("Unknown variable name");
-    return V;
+    return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
 }
 
 Value *UnaryExprAST::codegen() {
@@ -624,6 +697,23 @@ Value *UnaryExprAST::codegen() {
 }
 
 Value *BinaryExprAST::codegen() {
+    if (Op == '=') {
+        VariableExprAST *LHSE = static_cast<VariableExprAST *>(LHS.get());
+        if (!LHSE)
+            return LogErrorV("destination of '=' must be a variable");
+
+        Value *Val = RHS->codegen();
+        if (!Val)
+            return nullptr;
+
+        Value *Variable = NamedValues[LHSE->getName()];
+        if (!Variable)
+            return LogErrorV("Unknown variable name");
+
+        Builder->CreateStore(Val, Variable);
+        return Val;
+    }
+
     // それぞれ再帰的に出力
     Value *L = LHS->codegen();
     Value *R = RHS->codegen();
@@ -727,13 +817,18 @@ Value *IfExprAST::codegen() {
 }
 
 Value *ForExprAST::codegen() {
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    // エントリーブロックの変数にAllocaを作成
+    AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
     Value *StartVal = Start->codegen();
     if (!StartVal)
         return nullptr;
 
-    // ループヘッダ用の新しいブロックを作成し、挿入する
-    Function *TheFunction = Builder->GetInsertBlock()->getParent();
-    BasicBlock *PreHeaderBB = Builder->GetInsertBlock();
+    // Allocaに値を格納
+    Builder->CreateStore(StartVal, Alloca);
+
     BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
 
     // 現在のブロックからLoopBBへの明示的なフォールスルーを挿入する
@@ -741,13 +836,9 @@ Value *ForExprAST::codegen() {
 
     Builder->SetInsertPoint(LoopBB);
 
-    // ループ誘導変数用のPHIノードを作成する
-    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
-    Variable->addIncoming(StartVal, PreHeaderBB);
-
     // シンボルテーブルに変数を導入(シャドーイング)
-    Value *OldVal = NamedValues[VarName];
-    NamedValues[VarName] = Variable;
+    AllocaInst *OldVal = NamedValues[VarName];
+    NamedValues[VarName] = Alloca;
 
     // Bodyのコード化
     if (!Body->codegen())
@@ -763,25 +854,23 @@ Value *ForExprAST::codegen() {
         StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
     }
 
-    // ループの次の繰り返しにおけるループ変数の値
-    Value *NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
-
     Value *EndCondition = End->codegen();
     if (!EndCondition)
         return nullptr;
+
+    Value *CurrentVar = Builder->CreateLoad(Alloca->getAllocatedType(), Alloca, VarName.c_str());
+    Value *NextVar = Builder->CreateFAdd(CurrentVar, StepVal, "nextvar");
+    Builder->CreateStore(NextVar, Alloca);
 
     // ループの終了値を評価
     // if/then/else文の条件評価と同じ
     EndCondition = Builder->CreateFCmpONE(EndCondition, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
 
-    BasicBlock *LoopEndBB = Builder->GetInsertBlock();
     BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
 
     // 終了条件の値に基づいて、ループの再実行とループの終了のどちらかを選択する条件分岐を作成する
     Builder->CreateCondBr(EndCondition, LoopBB, AfterBB);
     Builder->SetInsertPoint(AfterBB);
-
-    Variable->addIncoming(NextVar, LoopEndBB);
 
     // ループ変数をシンボルテーブルから削除
     if (OldVal)
@@ -791,6 +880,45 @@ Value *ForExprAST::codegen() {
 
     // forループのコード生成は常に0.0を返す
     return Constant::getNullValue(Type::getDoubleTy(*TheContext));
+}
+
+Value *VarExprAST::codegen() {
+    std::vector<AllocaInst *> OldBindings;
+
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i) {
+        const std::string &VarName = VarNames[i].first;
+        ExprAST *Init = VarNames[i].second.get();
+
+        // イニシャライザを発行
+        Value *InitVal;
+        if (Init) {
+            InitVal = Init->codegen();
+            if (!InitVal)
+                return nullptr;
+        } else {
+            InitVal = ConstantFP::get(*TheContext, APFloat(0.0));
+        }
+
+        // Allocaを作成
+        AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+        Builder->CreateStore(InitVal, Alloca);
+
+        OldBindings.push_back(NamedValues[VarName]);
+        // シンボルテーブルを更新
+        NamedValues[VarName] = Alloca;
+    }
+
+    Value *BodyVal = Body->codegen();
+    if (!BodyVal)
+        return nullptr;
+
+    // 以前の変数に戻す
+    for (unsigned i = 0, e = VarNames.size(); i != e; ++i)
+        NamedValues[VarNames[i].first] = OldBindings[i];
+
+    return BodyVal;
 }
 
 Function *PrototypeAST::codegen() {
@@ -834,8 +962,14 @@ Function *FunctionAST::codegen() {
 
     // NamedValuesに引数を保存(VariableExprASTノードからアクセスできるようにする)
     NamedValues.clear();
-    for (auto &Arg: TheFunction->args())
-        NamedValues[std::string(Arg.getName())] = &Arg;
+    for (auto &Arg: TheFunction->args()) {
+        // 変数のAllocaを作成
+        AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, Arg.getName());
+
+        Builder->CreateStore(&Arg, Alloca);
+
+        NamedValues[std::string(Arg.getName())] = Alloca;
+    }
 
     if (Value *RetVal = Body->codegen()) {
         Builder->CreateRet(RetVal);
@@ -851,6 +985,9 @@ Function *FunctionAST::codegen() {
 
     // エラー処理
     TheFunction->eraseFromParent();
+
+    if (P.isBinaryOperator())
+        BinaryOperatorPrecedence.erase(P.getOperatorName());
     return nullptr;
 }
 
@@ -863,14 +1000,16 @@ static void InitializeModuleAndPassManager() {
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
     TheModule->setDataLayout(TheJIT->getDataLayout());
 
+    Builder = std::make_unique<IRBuilder<>>(*TheContext);
+
     TheFunctionPassManager = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    TheFunctionPassManager->add(createPromoteMemoryToRegisterPass());
     TheFunctionPassManager->add(createInstructionCombiningPass());
     TheFunctionPassManager->add(createReassociatePass());
     TheFunctionPassManager->add(createGVNPass());
     TheFunctionPassManager->add(createCFGSimplificationPass());
     TheFunctionPassManager->doInitialization();
-
-    Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
 
 static void HandleDefinition() {
@@ -911,7 +1050,7 @@ static void HandleTopLevelExpression() {
 
             auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
             ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-            // 後続のコードを格納する新しいモジュールを追加する
+            // 後続のコードを格納する新しいモジュールを追加
             InitializeModuleAndPassManager();
 
             // 最終的に生成されるコードへのポインタを取得
@@ -980,6 +1119,7 @@ int main(int argc, char *argv[]) {
     InitializeNativeTargetAsmPrinter();
     InitializeNativeTargetAsmParser();
 
+    BinaryOperatorPrecedence['='] = 2;
     BinaryOperatorPrecedence['<'] = 10;
     BinaryOperatorPrecedence['+'] = 20;
     BinaryOperatorPrecedence['-'] = 20;
