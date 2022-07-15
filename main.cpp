@@ -1,5 +1,5 @@
-#include "include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -12,23 +12,31 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Host.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetOptions.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Utils.h"
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
-using namespace llvm::orc;
+using namespace llvm::sys;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -640,7 +648,7 @@ static std::unique_ptr<legacy::FunctionPassManager> TheFunctionPassManager;
 // JITに追加されたすべてのモジュールを、新しいものから順に検索し、最新の定義を見つける
 // 見つからない場合は、Kaleidoscopeプロセス自体で "dlsym("sin")" を呼び出す
 // libm版のsinを直接呼び出される
-static std::unique_ptr<KaleidoscopeJIT> TheJIT;
+//static std::unique_ptr<KaleidoscopeJIT> TheJIT;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 static ExitOnError ExitOnErr;
 
@@ -998,7 +1006,7 @@ Function *FunctionAST::codegen() {
 static void InitializeModuleAndPassManager() {
     TheContext = std::make_unique<LLVMContext>();
     TheModule = std::make_unique<Module>("my cool jit", *TheContext);
-    TheModule->setDataLayout(TheJIT->getDataLayout());
+//    TheModule->setDataLayout(TheJIT->getDataLayout());
 
     Builder = std::make_unique<IRBuilder<>>(*TheContext);
 
@@ -1018,8 +1026,8 @@ static void HandleDefinition() {
             fprintf(stderr, "Read function definition:\n");
             FnIR->print(errs());
             fprintf(stderr, "\n");
-            ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
-            InitializeModuleAndPassManager();
+            // ExitOnErr(TheJIT->addModule(ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
+            // InitializeModuleAndPassManager();
         }
     } else {
         getNextToken();
@@ -1041,28 +1049,29 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
     if (auto FnAST = ParseTopLevelExpr()) {
-        if (auto *FnIR = FnAST->codegen()) {
-            fprintf(stderr, "Read top level expression:\n");
-            FnIR->print(errs());
-            fprintf(stderr, "\n");
-
-            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
-
-            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
-            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-            // 後続のコードを格納する新しいモジュールを追加
-            InitializeModuleAndPassManager();
-
-            // 最終的に生成されるコードへのポインタを取得
-            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
-            // 関数のメモリ内アドレスを取得
-            double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
-            // 結果ポインタをその型の関数ポインタにキャストして直接呼び出すだけで良い(JITコンパイルされたコードと、アプリケーションに静的にリンクされたネイティブのマシンコードとの間に差はない)
-            fprintf(stderr, "Evaluated to %f\n", FP());
-
-            ExitOnErr(RT->remove());
-        }
+        FnAST->codegen();
+//        if (auto *FnIR = FnAST->codegen()) {
+//            fprintf(stderr, "Read top level expression:\n");
+//            FnIR->print(errs());
+//            fprintf(stderr, "\n");
+//
+//            auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+//
+//            auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
+//            ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+//            // 後続のコードを格納する新しいモジュールを追加
+//            InitializeModuleAndPassManager();
+//
+//            // 最終的に生成されるコードへのポインタを取得
+//            auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+//
+//            // 関数のメモリ内アドレスを取得
+//            double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+//            // 結果ポインタをその型の関数ポインタにキャストして直接呼び出すだけで良い(JITコンパイルされたコードと、アプリケーションに静的にリンクされたネイティブのマシンコードとの間に差はない)
+//            fprintf(stderr, "Evaluated to %f\n", FP());
+//
+//            ExitOnErr(RT->remove());
+//        }
     } else {
         getNextToken();
     }
@@ -1128,13 +1137,61 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
+    // TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
 
     InitializeModuleAndPassManager();
 
     MainLoop();
 
-    TheModule->print(errs(), nullptr);
+    InitializeAllTargetInfos();
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmParsers();
+    InitializeAllAsmPrinters();
+
+    auto TargetTriple = sys::getDefaultTargetTriple();
+    TheModule->setTargetTriple(TargetTriple);
+
+    std::string Error;
+    auto Target = TargetRegistry::lookupTarget(TargetTriple, Error);
+
+    if (!Target) {
+        errs() << Error;
+        return 1;
+    }
+
+    auto CPU = "generic";
+    auto Features = "";
+
+    TargetOptions opt;
+    auto RM = Optional<Reloc::Model>();
+    auto TheTargetMachine = Target->createTargetMachine(TargetTriple, CPU, Features, opt, RM);
+
+    TheModule->setDataLayout(TheTargetMachine->createDataLayout());
+
+    auto Filename = "output.o";
+    std::error_code EC;
+    raw_fd_ostream dest(Filename, EC, sys::fs::OF_None);
+
+    if (EC) {
+        errs() << "Could not open file: " << EC.message();
+        return 1;
+    }
+
+    legacy::PassManager pass;
+    auto FileType = CGFT_ObjectFile;
+
+    if (TheTargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+        errs() << "TheTargetMachine can't emit a file of this type";
+        return 1;
+    }
+
+    pass.run(*TheModule);
+    dest.flush();
+
+    outs() << "Wrote " << Filename << "\n";
+
+    // TheModule->print(errs(), nullptr);
 
     return 0;
 }
